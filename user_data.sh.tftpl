@@ -1,0 +1,116 @@
+#!/bin/bash
+set -euxo pipefail
+
+exec > >(tee /var/log/tfe-user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+
+dnf -y update
+
+dnf install -y \
+  dnf-plugins-core \
+  curl \
+  xfsprogs \
+  device-mapper-persistent-data \
+  lvm2 \
+  ca-certificates \
+  gnupg2
+
+dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
+
+dnf install -y \
+  docker-ce \
+  docker-ce-cli \
+  containerd.io \
+  docker-buildx-plugin \
+  docker-compose-plugin
+
+systemctl enable docker
+systemctl start docker
+
+usermod -aG docker ec2-user || true
+chmod 666 /var/run/docker.sock || true
+
+mkdir -p /opt/tfe/certs
+mkdir -p /opt/tfe/data
+
+cat > /opt/tfe/certs/cert.pem <<'EOF_CERT'
+${tls_cert_pem}
+EOF_CERT
+
+cat > /opt/tfe/certs/key.pem <<'EOF_KEY'
+${tls_key_pem}
+EOF_KEY
+
+cat > /opt/tfe/certs/bundle.pem <<'EOF_BUNDLE'
+${tls_bundle_pem}
+EOF_BUNDLE
+
+DEVICE_CANDIDATE=""
+for dev in /dev/nvme1n1 /dev/xvdf /dev/sdf; do
+  if [ -b "$dev" ]; then
+    DEVICE_CANDIDATE="$dev"
+    break
+  fi
+done
+
+if [ -n "$DEVICE_CANDIDATE" ]; then
+  if ! blkid "$DEVICE_CANDIDATE"; then
+    mkfs -t xfs "$DEVICE_CANDIDATE"
+  fi
+
+  UUID=$(blkid -s UUID -o value "$DEVICE_CANDIDATE")
+  grep -q "$UUID" /etc/fstab || echo "UUID=$UUID /opt/tfe/data xfs defaults,nofail 0 2" >> /etc/fstab
+  mount -a
+else
+  echo "No attached data device found"
+fi
+
+echo '${tfe_license}' | docker login --username terraform images.releases.hashicorp.com --password-stdin
+docker pull ${tfe_image}
+
+cat > /opt/tfe/docker-compose.yml <<'EOF_COMPOSE'
+version: '3.2'
+name: terraform-enterprise
+services:
+  tfe:
+    image: ${tfe_image}
+    environment:
+      TFE_LICENSE: "${tfe_license}"
+      TFE_HOSTNAME: "${tfe_hostname}"
+      TFE_ENCRYPTION_PASSWORD: "${tfe_encryption_password}"
+      TFE_OPERATIONAL_MODE: "disk"
+      TFE_DISK_CACHE_VOLUME_NAME: "terraform-enterprise_terraform-enterprise-cache"
+      TFE_TLS_CERT_FILE: "/etc/ssl/private/terraform-enterprise/cert.pem"
+      TFE_TLS_KEY_FILE: "/etc/ssl/private/terraform-enterprise/key.pem"
+      TFE_TLS_CA_BUNDLE_FILE: "/etc/ssl/private/terraform-enterprise/bundle.pem"
+      TFE_IACT_SUBNETS: "0.0.0.0/0"
+      TFE_USE_SUPERVISORD: "true"
+    cap_add:
+      - IPC_LOCK
+    read_only: true
+    tmpfs:
+      - /tmp:mode=01777
+      - /run
+      - /var/log/terraform-enterprise
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /run/docker.sock
+      - type: bind
+        source: /opt/tfe/certs
+        target: /etc/ssl/private/terraform-enterprise
+      - type: bind
+        source: /opt/tfe/data
+        target: /var/lib/terraform-enterprise
+      - type: volume
+        source: terraform-enterprise-cache
+        target: /var/cache/tfe-task-worker/terraform
+volumes:
+  terraform-enterprise-cache:
+EOF_COMPOSE
+
+cd /opt/tfe
+docker compose up -d
+
